@@ -1,0 +1,28 @@
+# Node modules
+node_modules/
+
+# Production build outputs
+dist/
+dist-electron/
+build/
+coverage/
+
+# Environment files
+.env*
+!.env.example
+
+# Logs and OS files
+*.log
+.DS_Store
+.vscode/
+
+# IDE / editor local state (machine-specific, not project source)
+.idea/
+.antigravity/
+
+.vercel
+.env*
+
+# Firebase Admin SDK service account credentials — never commit these
+backend/serviceAccountKey.json
+**/serviceAccountKey.json

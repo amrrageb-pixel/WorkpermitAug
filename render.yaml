@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: permit-to-work-backend
+    env: node
+    buildCommand: npm install && npm run build -w backend
+    startCommand: npm run start -w backend
+    envVars:
+      - key: NODE_VERSION
+        value: 20.x

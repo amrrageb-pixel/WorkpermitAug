@@ -1,0 +1,173 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ── Identity helpers ──────────────────────────────────────────────────
+    // request.auth.token.{tenantId,role,platformAdmin} are custom claims minted by the
+    // backend (backend/auth.ts) only after it verifies the caller's password server-side
+    // via /api/auth/login. Nothing here trusts anything the client asserts about itself.
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function callerTenant() {
+      return request.auth.token.tenantId;
+    }
+
+    function callerRole() {
+      return request.auth.token.role;
+    }
+
+    function isPlatformAdmin() {
+      return isSignedIn() && request.auth.token.platformAdmin == true;
+    }
+
+    // True for the tenant's own signed-in members, and for platform admins acting on any tenant.
+    function isSameTenant(tenantId) {
+      return isSignedIn() && (callerTenant() == tenantId || isPlatformAdmin());
+    }
+
+    function isAdminCapable() {
+      return isSignedIn() && (
+        isPlatformAdmin() ||
+        callerRole() in ['SUPER_ADMIN', 'SAFETY_MANAGER', 'PLATFORM_ADMIN', 'COMPANY_ADMIN']
+      );
+    }
+
+    function isTenantScoped(tenantId) {
+      return request.resource.data.tenantId == tenantId;
+    }
+
+    // ── Permit (PTW) state-machine enforcement ──────────────────────────────
+    // Encodes the same lifecycle PermitDetail.tsx's UI already walks the user through — the
+    // difference is this is now the layer that actually can't be bypassed by calling the
+    // Firestore SDK/REST API directly instead of clicking through the app.
+    function permitAllowedNextStatuses() {
+      return {
+        'DRAFT':         ['DRAFT', 'PENDING_DEPT', 'HSE_REVIEW', 'REJECTED'],
+        'PENDING_DEPT':  ['PENDING_DEPT', 'HSE_REVIEW', 'REJECTED'],
+        'HSE_REVIEW':    ['HSE_REVIEW', 'ACTIVE', 'REJECTED'],
+        'ACTIVE':        ['ACTIVE', 'SUSPENDED', 'PENDING_CLOSE', 'EXPIRED'],
+        'SUSPENDED':     ['SUSPENDED', 'ACTIVE'],
+        'PENDING_CLOSE': ['PENDING_CLOSE', 'CLOSED', 'ACTIVE'],
+        'CLOSED':        ['CLOSED'],
+        'REJECTED':      ['REJECTED'],
+        'EXPIRED':       ['EXPIRED', 'CLOSED']
+      };
+    }
+
+    function permitTransitionAllowed() {
+      let before = resource.data.status;
+      let after = request.resource.data.status;
+      let table = permitAllowedNextStatuses();
+      return after == before || (before in table && after in table[before]);
+    }
+
+    function isNewlyApproving(field) {
+      return request.resource.data[field] == true && resource.data[field] != true;
+    }
+
+    // A permit may only go ACTIVE once HSE has signed off, and — when a gas test is required —
+    // once it has actually passed. Mirrors the same guard PermitDetail.tsx's handleHseAction
+    // and handleSupervisorVerify already apply client-side.
+    function activationGuardSatisfied() {
+      return request.resource.data.status != 'ACTIVE' || resource.data.status == 'ACTIVE' || (
+        request.resource.data.hseApproval == true &&
+        (request.resource.data.gasTestRequired != true || request.resource.data.gasTestPassed == true)
+      );
+    }
+
+    function permitApprovalRolesRespected() {
+      return (!isNewlyApproving('productionApproval') || callerRole() == 'PRODUCTION_DEPT' || isAdminCapable())
+        && (!isNewlyApproving('electricalApproval') || callerRole() == 'ELECTRICAL_DEPT' || isAdminCapable())
+        && (!isNewlyApproving('hseApproval') || callerRole() in ['SAFETY_MANAGER', 'SAFETY_SUPERVISOR'] || isAdminCapable());
+    }
+
+    // ── Tenants ──────────────────────────────────────────────────────────
+    match /ehs_tenants/{tenantId} {
+      // Public: the login screen needs to list companies before anyone is authenticated.
+      // Tenant docs hold only name/plan/status metadata — nothing secret.
+      allow read: if true;
+      allow create, update: if isPlatformAdmin() && isTenantScoped(tenantId);
+      allow delete: if false;
+
+      // ── Users ──────────────────────────────────────────────────────────
+      match /users/{empCode} {
+        allow read: if isSameTenant(tenantId);
+        // Clients may create/update profile fields but must never write `password` directly —
+        // that field is only ever set by the backend (bcrypt, via /api/auth/login,
+        // /api/auth/reset-password, or /api/users/set-password), which bypasses these rules
+        // entirely using the Admin SDK.
+        allow create, update: if isSameTenant(tenantId) && isAdminCapable()
+          && isTenantScoped(tenantId)
+          && !('password' in request.resource.data);
+        allow delete: if isSameTenant(tenantId) && isAdminCapable();
+      }
+
+      // ── Permits (PTW records) ────────────────────────────────────────────
+      match /ptw_records/{permitId} {
+        allow read: if isSameTenant(tenantId);
+        allow create: if isSameTenant(tenantId) && isTenantScoped(tenantId)
+          && request.resource.data.status == 'DRAFT';
+        allow update: if isSameTenant(tenantId) && isTenantScoped(tenantId)
+          && permitTransitionAllowed()
+          && activationGuardSatisfied()
+          && permitApprovalRolesRespected();
+        allow delete: if isSameTenant(tenantId)
+          && (isAdminCapable() || resource.data.status == 'DRAFT');
+      }
+
+      // ── Incidents / HIRA / Audits / Training ────────────────────────────
+      // These modules don't carry the same multi-party approval state machine as permits;
+      // any signed-in tenant member may record and update them, but deletion (which erases
+      // safety history) is restricted to admin-capable roles.
+      match /ehs_incidents/{incidentId} {
+        allow read: if isSameTenant(tenantId);
+        allow create, update: if isSameTenant(tenantId) && isTenantScoped(tenantId);
+        allow delete: if isSameTenant(tenantId) && isAdminCapable();
+      }
+
+      match /ehs_hiras/{hiraId} {
+        allow read: if isSameTenant(tenantId);
+        allow create, update: if isSameTenant(tenantId) && isTenantScoped(tenantId);
+        allow delete: if isSameTenant(tenantId) && isAdminCapable();
+      }
+
+      match /ehs_audits/{auditId} {
+        allow read: if isSameTenant(tenantId);
+        allow create, update: if isSameTenant(tenantId) && isTenantScoped(tenantId);
+        allow delete: if isSameTenant(tenantId) && isAdminCapable();
+      }
+
+      match /ehs_trainings/{trainingId} {
+        allow read: if isSameTenant(tenantId);
+        allow create, update: if isSameTenant(tenantId) && isTenantScoped(tenantId);
+        allow delete: if isSameTenant(tenantId) && isAdminCapable();
+      }
+
+      // ── Tenant audit log: append-only, never editable or deletable ──────
+      match /audit_logs/{logId} {
+        allow read: if isSameTenant(tenantId);
+        allow create: if isSameTenant(tenantId) && isTenantScoped(tenantId);
+        allow update, delete: if false;
+      }
+    }
+
+    // ── Global (cross-tenant) audit log: append-only ──────────────────────
+    match /global_audit_logs/{logId} {
+      allow read: if isSignedIn();
+      allow create: if isSignedIn();
+      allow update, delete: if false;
+    }
+
+    // ── Credentials ──────────────────────────────────────────────────────
+    // Password hashes live here, never on the user profile doc, and are never readable or
+    // writable by any client SDK — only the backend's Firebase Admin SDK (which bypasses
+    // rules entirely) may touch this collection, via /api/auth/login, /api/auth/reset-password,
+    // and /api/users/set-password.
+    match /credentials/{credId} {
+      allow read, write: if false;
+    }
+  }
+}

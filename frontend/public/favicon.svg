@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <defs>
+    <linearGradient id="ptwGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#ea580c"/>
+      <stop offset="100%" stop-color="#059669"/>
+    </linearGradient>
+  </defs>
+  <path fill="url(#ptwGrad)" d="M256 32L64 96v160c0 128 96 224 192 256 96-32 192-128 192-256V96L256 32z"/>
+  <path fill="#ffffff" d="M224 336l-80-80 32-32 48 48 112-112 32 32-144 144z"/>
+</svg>
